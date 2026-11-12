@@ -61,10 +61,13 @@ def main():
 
     frames = function(src, "int dlss_fg_frames(")
     started = frames.index("if (!fg_start(g) || count < 1) return 0;")
-    given_up = frames.find("if (g.refusals >= kFgRefusalsOff) return g.refused++, 0;")
+    given_up = frames.find("if (g.refusals >= kFgRefusalsOff) {")
     create = frames.index("NGX_VK_CREATE_DLSSG(")
     if not started < given_up < create:
         fail("dlss_fg_frames: a set after frame generation was given up still goes to NGX")
+    guard = frames[given_up:frames.index("}", given_up)]
+    if "if (g.feature) fg_release(g);" not in guard or "return g.refused++, 0;" not in frames[given_up:given_up + 300]:
+        fail("dlss_fg_frames: after giving up, the refused sets' feature is not let go (held for the rest of the run)")
     refused = frames.index("was refused (%#x)")
     off_at = frames.find("if (++g.refusals == kFgRefusalsOff) {", refused)
     if off_at < 0 or "g.start_failed = true;" not in frames[off_at:off_at + 200]:
@@ -79,6 +82,8 @@ def main():
     start = function(src, "bool fg_start(Fg& g) {")
     if "runtime_dirs(game_dir())" not in start or "kFgRuntimeName" not in start or "the driver's own" not in start:
         fail("fg_start: does not say whether frame generation's runtime is in the runtime folders or the driver's own is used")
+    if "dlss_checks::ascii(fs::canonical(" not in start or "not all ASCII" not in start:
+        fail("fg_start: on Linux a runtime only in a folder whose path is not ASCII is said to be used (NGX does not load it)")
     print("DLSS Frame Generation: its runtime installed and looked for by one name; given up after %s refused sets in a row"
           % off.group(1))
 

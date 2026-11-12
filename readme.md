@@ -691,28 +691,33 @@ license. Never share a game folder built with them, and do not post builds made 
 
 - **Windows, the Hookshot Builder:** tick **NVIDIA DLSS (downloads NVIDIA's SDK under NVIDIA's license)** before you
   build. It is off by default and shows NVIDIA's license when you tick it. The build downloads the SDK into
-  `%LOCALAPPDATA%\HookshotBuilder\ngx-sdk` and puts DLSS's runtime, `nvngx_dlss.dll`, in the game folder's `ngx` folder.
+  `%LOCALAPPDATA%\HookshotBuilder\ngx-sdk` and puts DLSS's runtime, `nvngx_dlss.dll`, and DLSS Frame Generation's,
+  `nvngx_dlssg.dll`, in the game folder's `ngx` folder.
 - **Windows, the command line:** `python -I scripts/ngx_sdk.py --platform windows <sdk folder>` asks you to accept
-  NVIDIA's license (or pass `--accept-nvidia-license`) and fetches the headers, `nvsdk_ngx_s.lib` and `nvngx_dlss.dll`,
-  each checked against its SHA-256. Then build with `HOOKSHOT_NGX_SDK=<sdk folder>`: `make_game.py` copies
-  `nvngx_dlss.dll` into `<game folder>\ngx`. NGX is also pointed at `%LOCALAPPDATA%\Hookshot\ngx`, and at
-  `RX_VK_DLSS_DIR` when it is set, and uses the newest `nvngx_dlss.dll` it finds across them (to try a given one, make
-  sure no other folder has a newer one). Never copy NGX's core, `_nvngx.dll`, beside the game: it comes with NVIDIA's
-  driver.
+  NVIDIA's license (or pass `--accept-nvidia-license`) and fetches the headers, `nvsdk_ngx_s.lib`, `nvngx_dlss.dll` and
+  `nvngx_dlssg.dll`, each checked against its SHA-256. Then build with `HOOKSHOT_NGX_SDK=<sdk folder>`: `make_game.py`
+  copies both runtimes into `<game folder>\ngx`. NGX is also pointed at `%LOCALAPPDATA%\Hookshot\ngx`, and at
+  `RX_VK_DLSS_DIR` when it is set, and uses the newest of each it finds across them (to try a given one, make sure no
+  other folder has a newer one). Without `nvngx_dlssg.dll` there, frame generation takes the driver's own copy, which
+  may be older: one that makes 1 frame at most, or refuses every set. Never copy NGX's core, `_nvngx.dll`, beside
+  the game: it comes with NVIDIA's driver.
 - **Linux, the Hookshot Builder (the AppImage):** the same tick as on Windows, and nothing else to do: no variable is
   passed to the AppImage and no file is copied by hand. The build downloads the SDK into the builder's cache folder,
   `$XDG_CACHE_HOME/hookshot-builder/ngx-sdk` (`~/.cache/hookshot-builder/ngx-sdk`), builds the game with it and puts
-  DLSS's runtime, `libnvidia-ngx-dlss.so.<version>`, in the game folder's `ngx` folder. The builder's settings
+  DLSS's runtime, `libnvidia-ngx-dlss.so.<version>`, and frame generation's, `libnvidia-ngx-dlssg.so.<version>`, in
+  the game folder's `ngx` folder. The builder's settings
   (`~/.config/hookshot/builder.ini`) remember that you accepted NVIDIA's license, so an update keeps DLSS even after the
   cache was emptied: it downloads the SDK again.
 - **Linux, a build from source:** `scripts/linux/ngx-sdk.sh <sdk folder>` (it runs `scripts/ngx_sdk.py --platform
-  linux`) asks you to accept NVIDIA's license and fetches `libnvsdk_ngx.a` for the build and
-  `libnvidia-ngx-dlss.so.<version>`, DLSS's runtime. Then run the build with `HOOKSHOT_NGX_SDK=<sdk folder>` set:
-  `make_game.py` puts the runtime in the game folder's `ngx` folder. NGX's core comes with NVIDIA's Linux driver.
+  linux`) asks you to accept NVIDIA's license and fetches `libnvsdk_ngx.a` for the build,
+  `libnvidia-ngx-dlss.so.<version>`, DLSS's runtime, and `libnvidia-ngx-dlssg.so.<version>`, frame generation's. Then
+  run the build with `HOOKSHOT_NGX_SDK=<sdk folder>` set: `make_game.py` puts both runtimes in the game folder's `ngx`
+  folder. NGX's core comes with NVIDIA's Linux driver.
 - **Linux, a game folder with other than plain English letters in its path:** NVIDIA's NGX on Linux loads DLSS's
-  runtime only from a folder whose whole path is ASCII. A game in `~/Games/Zelda` needs nothing more. A game in a
-  folder such as `~/Games/Zelda-Café` (the `é` is not ASCII) cannot use the runtime in its own `ngx` folder, and the
-  log and the Insert menu say so: copy `libnvidia-ngx-dlss.so.*` from there into `$XDG_DATA_HOME/hookshot/ngx`
+  runtimes only from a folder whose whole path is ASCII. A game in `~/Games/Zelda` needs nothing more. A game in a
+  folder such as `~/Games/Zelda-Café` (the `é` is not ASCII) cannot use the runtimes in its own `ngx` folder, and the
+  log and the Insert menu say so: copy `libnvidia-ngx-dlss.so.*` and `libnvidia-ngx-dlssg.so.*` from there into
+  `$XDG_DATA_HOME/hookshot/ngx`
   (`~/.local/share/hookshot/ngx`), which the game also looks in, or into any other folder with an ASCII path and name
   that folder in `RX_VK_DLSS_DIR`.
 

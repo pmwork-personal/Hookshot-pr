@@ -152,7 +152,7 @@ def fetch_one(path, digest, dst, opener=urllib.request.urlopen):
 
 
 def fetch(sdk, platform, opener=urllib.request.urlopen, say=print, runtime=True):
-    """Every file of that platform into the SDK folder (runtime=False: not DLSS's runtime)"""
+    """Every file of that platform into the SDK folder (runtime=False: not the runtimes, DLSS's and frame generation's)"""
     for path, digest, rel in files(platform, runtime):
         if fetch_one(path, digest, os.path.join(sdk, *rel.split("/")), opener):
             say("ngx-sdk: %s" % rel)

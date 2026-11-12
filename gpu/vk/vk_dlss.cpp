@@ -661,16 +661,29 @@ bool fg_start(Fg& g) {
     g.most = most ? most : 1;
     // (its runtime: NGX takes the newest nvngx_dlssg in the runtime folders, else the driver's own copy, which may be older
     // and make 1 frame at most, or refuse every set. scripts/ngx_sdk.py puts the SDK's beside DLSS's runtime)
+    // (Linux: NGX loads it by its real path, ASCII only, as DLSS's runtime: one only in folders named otherwise is not used)
     std::string where;
-    bool here = false;
+    bool here = false, loadable = false;
     std::error_code ec;
     for (const auto& d : runtime_dirs(game_dir())) {
         where += (where.empty() ? "" : ", ") + shown(d);
-        for (const auto& f : fs::directory_iterator(d, ec)) here |= f.path().filename().native().rfind(kFgRuntimeName, 0) == 0;
+        for (const auto& f : fs::directory_iterator(d, ec))
+            if (f.path().filename().native().rfind(kFgRuntimeName, 0) == 0) {
+                here = true;
+#ifdef _WIN32
+                loadable = true;
+#else
+                std::error_code real;
+                loadable |= dlss_checks::ascii(fs::canonical(f.path(), real).native()) && !real;
+#endif
+            }
     }
-    const std::string runtime = here ? "its runtime: the newest " + std::string(kFgRuntime) + " in " + where
-                                     : "no " + std::string(kFgRuntime) + " in " + where +
-                                           ": the driver's own, which may be older (scripts/ngx_sdk.py fetches it)";
+    const std::string runtime =
+        loadable ? "its runtime: the newest " + std::string(kFgRuntime) + " in " + where
+        : here   ? std::string(kFgRuntime) + " only in folders whose path is not all ASCII (" + where +
+                     "), which NGX on Linux does not load from: the driver's own, which may be older"
+                 : "no " + std::string(kFgRuntime) + " in " + where +
+                     ": the driver's own, which may be older (scripts/ngx_sdk.py fetches it)";
     logf("vk: DLSS Frame Gen (NGX): available, up to %u made frames between two of the game's (%s)", g.most, runtime.c_str());
     g.ok = true;
     g.start_failed = false;
@@ -885,7 +898,11 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
         g.made = g.no_inputs = g.not_blended = g.too_many = g.refused = g.resets = g.still = g.no_interp = 0;
     }
     if (!fg_start(g) || count < 1) return 0;
-    if (g.refusals >= kFgRefusalsOff) return g.refused++, 0;   // (given up: dlss_fg_runs says no from here)
+    if (g.refusals >= kFgRefusalsOff) {   // (given up: dlss_fg_runs says no from here)
+        // (the refused sets' feature and its memory, let go once: vk_framegen.cpp still calls at 2x and up)
+        if (g.feature) fg_release(g);
+        return g.refused++, 0;
+    }
     if (!blend) return g.not_blended++, 0;
     if ((unsigned)count > g.most) {
         static bool told = false;   // (once a run: the 600-present lines count them)
