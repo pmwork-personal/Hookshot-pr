@@ -121,10 +121,10 @@ T& tls_make(T*& slot) {
 // frame, the counts a draw. FT_*: the sections of the descriptor build (banks, c1, user uniform buffers, storage buffers, textures) and
 // of the commands (hazards and the pass, pipeline bind, descriptor push, push constants, dynamic state, vertex and index binds, the draw)
 enum FineT { FT_BANK, FT_C1, FT_UBO, FT_STORAGE, FT_TEX, FT_HAZARD, FT_BINDPL, FT_BINDDESC, FT_PUSHCALL, FT_PUSHC, FT_DYN, FT_VERTEX,
-             FT_DRAWCALL, FT_COUNT };
+             FT_DRAWCALL, FT_TEXSTORE, FT_TEXHANDLE, FT_TEXVIEW, FT_TEXFP, FT_COUNT };
 const char* const kFineT[] = {"banks", "c1", "user uniform buffers", "storage buffers", "textures", "hazards+pass", "bind pipeline",
                                       "bind descriptors", "of it the push call", "push constants", "dynamic state", "vertex+index binds",
-                                      "draw call"};
+                                      "draw call", "of tex: storage-pointer test", "of tex: handle", "of tex: view", "of tex: fingerprint"};
 enum FineC { FC_DRAWS, FC_BUILDS, FC_DESCS, FC_WRITES, FC_BANK_CALLS, FC_BANK_GEN, FC_BANK_FILLS, FC_BANK_FILL_BYTES, FC_BANK_SAME,
              FC_BANK_NEW, FC_BANK_NEW_BYTES, FC_C1_CALLS, FC_UBO_CALLS, FC_UBO_OVERLAY, FC_UBO_STREAM, FC_PUSH_FULL, FC_PUSH_DELTA,
              FC_PUSH_NONE, FC_PUSH_WRITES, FC_PUSH_DESCS, FC_BIND_PIPE, FC_DYN_FAST, FC_DYN_FULL, FC_DYN_CALLS, FC_VBIND, FC_IBIND,
@@ -2873,6 +2873,19 @@ struct HandleHit {
     uint64_t tex_epoch;   // (the texture epoch it was last touched in)
 };
 TLS_OBJECT(handle_hits, std::unordered_map<uint64_t, HandleHit>)
+/* (hookshot) a direct-mapped front for handle_hits. The same texture bindings are resolved again and again (14.9 descriptors
+   a draw, 725 draws, 10,600 a frame) and a hash map find for each was 0.9 ms a frame. The map stays the authority: this
+   answers only a lookup whose key, slot version, destroy generation and texture epoch are all the ones it was filled with,
+   so a slot re-registered or a texture destroyed misses it at once and takes the map's path. RX_VK_VIEW_FAST=0: as before. */
+struct ViewFast {
+    uint64_t key = ~0ull;
+    VkImageView view = VK_NULL_HANDLE;
+    Texture* tex = nullptr;
+    uint32_t level = 0, version = 0;
+    uint64_t destroy_gen = 0, tex_epoch = 0;
+    bool sampling = false;
+};
+TLS_OBJECT(view_fast, std::array<ViewFast, 1024>)
 // (hookshot) RX_VK_TRACE_TEX=<w>x<h>,...: each draw sampling a texture of that size is logged with its state, every 30th frame, 600 lines: a
 // model that does not show is found by its textures, and whether the game draws it, and how, read from the line
 thread_local const Texture* trace_tex_hit = nullptr;
@@ -2914,6 +2927,22 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
     const uint32_t version = texture_slot_version((int)(handle & 0xFFFFF));
     const uint64_t dgen = texture_destroy_generation();
     const uint64_t key = (uint64_t)(handle & 0xFFFFF) | (uint64_t)want << 20 | (uint64_t)use << 28 | (uint64_t)storage_as << 32;
+    static const bool view_fast_on = !getenv("RX_VK_VIEW_FAST") || atoi(getenv("RX_VK_VIEW_FAST")) != 0;
+    ViewFast* vf = view_fast_on ? &view_fast()[(key * 0x9E3779B97F4A7C15ull) >> 54] : nullptr;
+    if (vf && vf->key == key && vf->version == version && vf->destroy_gen == dgen) {
+        // (the epoch's touch is done here, as the map's path does it: the map's own copy of the epoch may go stale, and then
+        // the first lookup of that key through the map touches the texture again, which only marks it used twice)
+        if (vf->tex && vf->tex_epoch != texture_epoch()) {
+            if (!texture_touch_quick(vf->tex, vf->sampling)) {
+                ParLock lk;
+                texture_touch(vf->tex, vf->sampling);
+            }
+            vf->tex_epoch = texture_epoch();
+        }
+        if (tex_out) *tex_out = vf->tex;
+        if (level_out) *level_out = vf->level;
+        return vf->view;
+    }
     static const bool log_hits = env_on("RX_VK_LOG_HITS");
     static int64_t st_hit, st_new, st_ver, st_gen, st_n;
     const auto it = handle_hits().find(key);
@@ -2934,6 +2963,10 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
             }
             it->second.tex_epoch = texture_epoch();
         }
+        if (vf)
+            vf->key = key, vf->view = it->second.view, vf->tex = it->second.tex, vf->level = it->second.level,
+            vf->version = it->second.version, vf->destroy_gen = it->second.destroy_gen, vf->tex_epoch = it->second.tex_epoch,
+            vf->sampling = it->second.sampling;
         if (tex_out) *tex_out = it->second.tex;
         if (level_out) *level_out = it->second.level;
         return it->second.view;
@@ -2965,6 +2998,8 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
         }
     }
     handle_hits()[key] = {view, tex, level, version, dgen, use == ViewUse::Sample || use == ViewUse::Storage, texture_epoch()};
+    if (vf) vf->key = key, vf->view = view, vf->tex = tex, vf->level = level, vf->version = version, vf->destroy_gen = dgen,
+            vf->tex_epoch = texture_epoch(), vf->sampling = use == ViewUse::Sample || use == ViewUse::Storage;
     if (tex_out) *tex_out = tex;
     if (level_out) *level_out = level;
     return view;
@@ -3636,13 +3671,24 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 // (fragment stages only, the water's case: in other stages (the foliage culling's) the textures went missing and
                 // the foliage was culled whenever Link swung his sword. RX_VK_HANDLE_POINTER_ALL=1: every stage, as before)
                 static const bool all_stages = env_on("RX_VK_HANDLE_POINTER_ALL");
-                const uint32_t handle = ((all_stages || st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT) && handle_is_storage_pointer(info, d, k))
-                                            ? 0u : handle_of(s, st, d, k);
-                desc_fp_note(handle);   // (Descriptor reuse)
+                uint32_t handle;
+                {
+                    FINE_SCOPE(FT_TEXSTORE);
+                    const bool store_ptr = (all_stages || st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT) && handle_is_storage_pointer(info, d, k);
+                    FINE_SCOPE(FT_TEXHANDLE);
+                    handle = store_ptr ? 0u : handle_of(s, st, d, k);
+                }
+                {
+                    FINE_SCOPE(FT_TEXFP);
+                    desc_fp_note(handle);   // (Descriptor reuse)
+                }
                 Texture* tex = nullptr;
                 upload_defer_ok = st.vk_stage != VK_SHADER_STAGE_COMPUTE_BIT;   // (a draw's: its new ASTC textures may wait a frame)
-                VkImageView view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex)
-                                          : VK_NULL_HANDLE;
+                VkImageView view;
+                {
+                    FINE_SCOPE(FT_TEXVIEW);
+                    view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex) : VK_NULL_HANDLE;
+                }
                 upload_defer_ok = false;
                 if (dump_on()) dump_input('t', (uint32_t)(dw().imgs.size() - 0), handle, view ? tex : nullptr);
                 if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
@@ -4996,7 +5042,10 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     if (value != hits_value) {            // collected between them; resolved handles last while their slot and
         hits_value = value;               // texture do, and are touched again once a submission)
         targets_serial = ~0ull;
-        if (handle_hits().size() > 65536) handle_hits().clear();
+        if (handle_hits().size() > 65536) {
+            handle_hits().clear();
+            for (ViewFast& f : view_fast()) f.key = ~0ull;   // (the front cache holds what the map held)
+        }
     }
     for (auto& row : bank_cache())
         for (BankCache& c : row) c = BankCache{}, c.at = UINT64_MAX;
@@ -5465,6 +5514,7 @@ struct StatsMeta {
     uint8_t dispatch;                 // (a compute dispatch: its grid, or its indirect arguments as above)
     uint32_t grid[3];
     uint64_t args_vkbuf, args_vkoff;  // (the Vulkan buffer and offset the arguments were read from)
+    uint64_t codes[4]{};             // native vertex/mesh/compute, fragment, task, header-only keys at recording time
 };
 VkQueryPool stats_pool = VK_NULL_HANDLE;
 // (indirect draws: after the draw, the first 16 bytes of its arguments and its count word as the GPU holds them, 32 bytes a
@@ -5584,6 +5634,19 @@ bool stats_make_pool() {
         qi.pipelineStatistics = base;
     }
     return vkCreateQueryPool(dev.device, &qi, nullptr, &stats_pool) == VK_SUCCESS;
+}
+void stats_code_keys(FILE* f, uint32_t n) {
+    // Keep distinct tuples: a program hash alone is not the recorded native stage identity.
+    std::map<std::array<uint64_t, 7>, uint32_t> groups;
+    for (uint32_t i = 0; i < n; i++) {
+        const StatsMeta& m = stats_meta[i];
+        groups[{m.prog, m.dispatch, m.mesh, m.codes[0], m.codes[1], m.codes[2], m.codes[3]}]++;
+    }
+    fprintf(f, "\n# native code keys: kind program queries | vertex/mesh/compute fragment task header\n");
+    for (const auto& [k, count] : groups)
+        fprintf(f, "code %s %016llx %u | %016llx %016llx %016llx %016llx\n", k[1] ? "comp" : k[2] ? "mesh" : "draw",
+                (unsigned long long)k[0], count, (unsigned long long)k[3], (unsigned long long)k[4],
+                (unsigned long long)k[5], (unsigned long long)k[6]);
 }
 /// (each draw) arms a capture when the trigger file is there; writes the results once the measured frame is long done
 void stats_tick() {
@@ -5708,6 +5771,7 @@ void stats_tick() {
                     (unsigned long long)x.fs, k == 0 ? "RAN, NO PRIMITIVES" : k == 1 ? "primitives, no fragments" : k == 2 ? "no shader work" : "",
                     x.indirect ? (" (indirect)" + x.args).c_str() : "");
         }
+        if (res == VK_SUCCESS) stats_code_keys(f, n);
         // who binds each indirect draw's argument words in this frame: written (W) or only read (r), by which programs
         std::vector<StatsBind> binds;
         {
@@ -5899,23 +5963,24 @@ struct StatsQuery {
     uint32_t index = 0;
     DrawArgs own{};
     const DrawArgs* draw = &own;
-    StatsQuery(VkCommandBuffer c, uint64_t prog, const DrawArgs& d) { begin(c, prog, d, false, nullptr); }
+    StatsQuery(VkCommandBuffer c, const Program& p, const DrawArgs& d) { begin(c, p, d, false, nullptr); }
     /// a compute dispatch: its grid, or its indirect arguments (12 bytes, read back as a draw's)
-    StatsQuery(VkCommandBuffer c, uint64_t prog, uint64_t indirect, uint32_t x, uint32_t y, uint32_t z) {
-        if (stats_dir()) watch_note(prog, indirect);
+    StatsQuery(VkCommandBuffer c, const Program& p, uint64_t indirect, uint32_t x, uint32_t y, uint32_t z) {
+        if (stats_dir()) watch_note(p.key, indirect);
         DrawArgs d{};
         d.indirect = indirect;
         const uint32_t grid[3] = {x, y, z};
-        begin(c, prog, d, true, grid);
+        begin(c, p, d, true, grid);
     }
-    void begin(VkCommandBuffer c, uint64_t prog, const DrawArgs& d, bool dispatch, const uint32_t* grid) {
+    void begin(VkCommandBuffer c, const Program& p, const DrawArgs& d, bool dispatch, const uint32_t* grid) {
         if (!stats_dir() || !stats_pool) return;
         const int64_t at = stats_frame.load(std::memory_order_relaxed);
         if (at < 0 || (int64_t)texture_frame_no() != at || stats_written.load(std::memory_order_relaxed)) return;
         const uint32_t i = stats_used.fetch_add(1);
         if (i >= kStatsQueries) return;
-        stats_meta[i] = {prog, (uint8_t)d.mesh, (uint8_t)(d.indirect != 0), (uint8_t)d.indexed, 0, d.count, d.instances, d.max,
+        stats_meta[i] = {p.key, (uint8_t)d.mesh, (uint8_t)(d.indirect != 0), (uint8_t)d.indexed, 0, d.count, d.instances, d.max,
                          d.stride, d.count_addr, d.indirect, {}, 0, (uint8_t)dispatch, {}, 0, 0};
+        std::memcpy(stats_meta[i].codes, p.codes, sizeof stats_meta[i].codes);
         if (grid) std::memcpy(stats_meta[i].grid, grid, sizeof stats_meta[i].grid);
         if (d.indirect) {
             host->gpu_read(d.indirect, stats_meta[i].guest, dispatch ? 12 : 16);
@@ -6099,7 +6164,7 @@ bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
 // with no error. They are most of the game's vegetation: the forest's trees, ferns and grass (GPU culling writes their counts, so they can only
 // be moved on the GPU): each count is copied into this buffer of (count, 1, 1) just before its draw. The GPU runs the copies and draws in
 // order, so a slot used again is safe. A first other than 0 has no Vulkan counterpart.
-constexpr uint32_t kMeshArgs = 1u << 18;   // (a ring: entries are reused 262144 draws on, frames after the GPU read them)
+constexpr uint32_t kMeshArgs = 1u << 19;   // (a ring: entries are reused 262144 draws on, frames after the GPU read them; ranges start in its first half)
 VkBuffer mesh_args_buffer = VK_NULL_HANDLE;
 VmaAllocation mesh_args_alloc = nullptr;
 uint32_t* mesh_args_words = nullptr;
@@ -6134,9 +6199,11 @@ bool mesh_args_ready() {
     }();
     return ok;
 }
-uint32_t mesh_args_take(uint32_t n) {   // (n entries of the ring, never entry 0; n below kMeshArgs: % 0 otherwise)
+uint32_t mesh_args_take(uint32_t n) {   // (n entries of the ring, never entry 0; n at most kMeshArgs / 2)
+    // (a fixed modulus: with one that changed with n, two draws close together could be given overlapping entries)
     static std::atomic<uint32_t> next{1};
-    const uint32_t at = next.fetch_add(n) % (kMeshArgs - n);
+    n = std::clamp<uint32_t>(n, 1, kMeshArgs / 2);
+    const uint32_t at = next.fetch_add(n) % (kMeshArgs / 2);
     return at + 1;
 }
 
@@ -7037,7 +7104,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // draw has no stride of its own: its entry is NVN's 16 bytes, taken as 8 the first was never copied)
     static const bool mesh_rewrite = getenv("RX_VK_MESH_ARGS") && atoi(getenv("RX_VK_MESH_ARGS")) != 0;   // (sharkiix version: off, as upstream)
     if (mesh_rewrite && d.mesh && d.indirect) {   // (out of the pass: a copy cannot be made in one)
-        const uint32_t n = (uint32_t)std::clamp(d.max, 1, (int)kMeshArgs - 1), stride = d.stride ? (uint32_t)d.stride : 16u;
+        const uint32_t n = (uint32_t)std::clamp(d.max, 1, (int)(kMeshArgs / 2)), stride = d.stride ? (uint32_t)d.stride : 16u;
         BufferRef src = gpu_buffer_bind(d.indirect, (uint64_t)n * stride, false);
         if (!src) SKIP_HERE();
         if (mesh_args_ready()) {
@@ -7210,7 +7277,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                      d.indirect ? " indirect" : "", d.count);
         }
     }
-    StatsQuery stats_query(cmd, p.key, d);   // (EvilOOT, RX_VK_DRAW_STATS)
+    StatsQuery stats_query(cmd, p, d);   // (EvilOOT, RX_VK_DRAW_STATS)
     if (stats_frame_now() && stats_prog_wanted(p.key)) {   // (and the wanted programs' buffers: a mesh draw's stages, fragment)
         for (const int stage : {6, 7, 1}) stats_dump_stage(p.key, s, stage);
         // (and as the GPU holds them, after it: RX_VK_GPU_DUMP=1 only; its bindings can sync a pool's mirror mid-frame, and
@@ -9427,7 +9494,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     }
     if (stats_dir()) watch_note_sb(p.key, s);   // (RX_VK_WATCH_SB)
     {
-        StatsQuery stats_query(cmd, p.key, indirect, x, y, z);   // (EvilOOT, RX_VK_DRAW_STATS)
+        StatsQuery stats_query(cmd, p, indirect, x, y, z);   // (EvilOOT, RX_VK_DRAW_STATS)
         {   // (RX_VK_GPU_DUMP=1 with RX_VK_DRAW_STATS_PROGS: the wanted dispatches' storage buffers as the GPU holds them after)
             static const bool gpu_dump_on = env_on("RX_VK_GPU_DUMP");
             if (gpu_dump_on && stats_query.cmd && stats_prog_wanted(p.key)) stats_query.state = &s, stats_query.prog = p.key;

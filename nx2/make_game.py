@@ -2484,7 +2484,8 @@ def main(a=None):
     with open(language, "w", encoding="utf-8", newline="\n") as f:
         f.write("# The game's language. Change the line below to one of the codes listed here, save, and start the game again.\n\n%s\n\n" % a.language)
         f.writelines("# %-8s %s\n" % l for l in LANGUAGES)
-    # (what the game's update offer reads, host/hos_update.c: which release these tools are, and where the builder that made the folder is)
+    # (what the folder's launcher reads, builder/setup/portable_home.h and builder/linux/hookshot-folder: which release these tools
+    # are, and where the builder that made the folder is)
     tag = ""
     for version_name in ("version.txt", "VERSION"):   # (VERSION: the AppImage, which has no version.txt)
         version = os.path.join(ROOT, version_name)
@@ -2501,9 +2502,6 @@ def main(a=None):
                 f.write("builder_local=1\n")
             elif os.environ.get("HOOKSHOT_BUILDER_EXE"):
                 f.write("builder=%s\n" % os.environ["HOOKSHOT_BUILDER_EXE"])
-                # (the Python builder: builder is its pythonw.exe, and these the arguments before --update, host/hos_update.c)
-                if os.environ.get("HOOKSHOT_BUILDER_ARGS"):
-                    f.write("builder_args=%s\n" % os.environ["HOOKSHOT_BUILDER_ARGS"])
     # (the game's code as read: written again by every build, so not left behind in the work folder. The translated code (sa\gen)
     # and the compiled objects stay: the next build skips the lift when nothing it reads changed (#428) and compiles only what
     # changed; the builder says how much stays and lets it go. Kept in a development checkout)

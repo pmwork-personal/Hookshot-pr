@@ -278,7 +278,9 @@ std::deque<Dead> dead;
 // replaying, once a second while the camera moves (RTX 5070, Kokiri Forest: 10,500 images made and destroyed in 4.5 minutes,
 // 17 GB). Now a render target's image whose texture is gone waits in a pool by its create info, views and all, and a new texture
 // of the same create info takes it; it is put into GENERAL from UNDEFINED and cleared as a new one is (create), so nothing it held
-// shows. Only images made for a target (texture_get's !for_sampling) are pooled. The pool is bounded (RX_VK_TARGET_POOL_MB, default
+// shows. An image the GPU is done with is pooled as it is evicted, not at the next present: the next frame, recorded between
+// the two, is where a target of its shape would have made a new image instead (issue 2180). Only images made for a target
+// (texture_get's !for_sampling) are pooled. The pool is bounded (RX_VK_TARGET_POOL_MB, default
 // 256; 0: none, every image destroyed as before; and none while VRAM is near what the driver allows), and an image unused in it for
 // 120 presents is destroyed, at most 16 a present ----
 struct Pooled {
@@ -518,6 +520,16 @@ Staging staging(uint64_t n, uint64_t align = 256) {
             return {a.buffer, 0, a.mapped, a.allocation};
         }
     }
+    for (Arena& a : arenas) {
+        if (a.value < rec_value) {
+            const uint64_t at = (a.used + align - 1) & ~(align - 1);
+            if (at + n <= a.size) {
+                a.value = rec_value, a.used = at + n;
+                a.used_at = std::chrono::steady_clock::now();
+                return {a.buffer, at, a.mapped + at, a.allocation};
+            }
+        }
+    }
     Arena a;
     void* m = nullptr;
     const auto make = [&](uint64_t size) {
@@ -560,6 +572,32 @@ Staging staging(uint64_t n, uint64_t align = 256) {
     return {a.buffer, 0, a.mapped, a.allocation};
 }
 
+/* (hookshot) The staging arenas, made before the game's pools and textures are. Making one later, with ~2.5 GB of pools and
+   textures held, took 12-25 ms on the Steam Deck (an 8 MB one could take 116 ms: it is the allocator, not the size), and
+   every one of them stalled the replay thread. That was the stutter when turning the camera: the arena the last burst used
+   had gone stale and been given back, so the first upload of the next burst made another. On an empty device they are cheap.
+   RX_VK_STAGING_PREWARM=<n>: how many, 0: none. */
+}  // namespace (the prewarm is called from the replay's start: it has to link)
+void texture_staging_prewarm(int n) {
+    int made = 0;
+    for (int i = 0; i < n; i++) {
+        Arena a;
+        void* m = nullptr;
+        if (!create_buffer(kArena, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, a.buffer,
+                           a.allocation, &m)) {
+            logf("vk: staging prewarm: only %d of %d arenas could be made", made, n);
+            return;
+        }
+        a.mapped = (uint8_t*)m;
+        a.size = kArena, a.used = 0, a.value = 0;
+        a.used_at = std::chrono::steady_clock::now();
+        arenas.push_back(a);
+        made++;
+    }
+    if (made) logf("vk: %d staging arenas of %llu MB made before the game's memory", made, (unsigned long long)(kArena >> 20));
+}
+
+namespace {
 // ---- the GPU ASTC decoder (Eden's) ----
 struct AstcPush {
     uint32_t block_dims[2], layer_stride, block_size, x_shift, block_height, block_height_mask, native_tiling;
@@ -1326,6 +1364,16 @@ bool upload_unswizzle_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     default: return false;
     }
     if (!unswizzle_ready()) return false;
+    // (hookshot) Only from a pool already imported: an import made here, for one upload, took 22-25 ms on the replay
+    // thread (the driver locks the pages): three of them when the camera turns to the Deku Tree, a 60 ms hitch. The CPU
+    // path (several threads from 4 MB) does a 15 MB level in a few ms. RX_VK_UNSWIZZLE_IMPORT=1: import as before
+    static const bool may_import = env_on("RX_VK_UNSWIZZLE_IMPORT");
+    if (!may_import) {   // (a virtual pool's address above 1 TB: its guest address, as gpu_buffer translates it)
+        uint64_t avail = 0;
+        if (!host->gpu_ptr(tex.gpu, &avail) || avail < total) return false;
+        const uint64_t guest = tex.gpu < (1ull << 40) ? tex.gpu : host->gpu_guest(tex.gpu);
+        if (!memory_guest_contained(guest, guest + total)) return false;
+    }
     const BufferRef src = gpu_buffer(tex.gpu, total);
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 16);
     if (!src || (src.offset % align)) return false;
@@ -1741,7 +1789,12 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
                 const uint32_t px_h = std::min(g.h - y0 * (uint32_t)tex.block_h, th * (uint32_t)tex.block_h);
                 const uint64_t out_bytes = tex.astc ? (uint64_t)g.w * px_h * g.d * 4 : (uint64_t)g.tw * th * g.td * out_bpb;
                 const Staging st = staging((out_bytes + 15) & ~15ull, 16);
-                if (!st.buffer) return false;
+                if (!st.buffer) {
+                    // (the sparse binds queued by the rows before are this image's: bound now, not left in sparse_binds
+                    // for the next flush, which binds them into another texture's image)
+                    texture_resident_flush(&tex);
+                    return false;
+                }
                 if (buffer && st.buffer != buffer && !copies.empty()) {   // (a new arena: copy what the last one holds)
                     texture_resident_flush(&tex);
                     checkpoint_mark(upload_cmd(), tex.gpu, 'u');
@@ -1765,7 +1818,9 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
                     // course maps the title loads at each scene change, 6 of 349 MB, took ~100 ms each on one. Their
                     // storage is sparse: each thread gathers its own rows, 8 MB at a time, rather than all of it
                     // being copied first (a 349 MB scratch beside the 349 MB staged))
-                    const uint32_t nthreads = block_bytes >= (16u << 20) && g.td == 1 && !g.tile_d
+                    // (hookshot: from 4 MB, not 16: the scene-size targets uploaded when the camera turns to the Deku Tree,
+                    // 2779 x 1318 RGBA8 = 15 MB, took ~20 ms each on one thread, three in one frame: a 50 ms hitch)
+                    const uint32_t nthreads = block_bytes >= (4u << 20) && g.td == 1 && !g.tile_d
                                                   ? std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u) : 1u;
                     uint64_t avail = 0;
                     const uint8_t* direct = host->gpu_ptr(tex.gpu + from, &avail);
@@ -2002,18 +2057,23 @@ bool texture_dirty(Texture& tex, uint32_t gen, Ranges& out) {
 
 uint64_t destroy_gen = 1;   // (bumped when textures go: what was resolved to them goes stale)
 
+/// (A render target's image goes to the pool now rather than at the next present: between the two, the next frame is
+/// recorded, and a target of its shape made there missed it and made a new image, while the old one was destroyed unused
+/// later, 120 presents on (issue 2180's A/B: 65% more targets let go, 83% more images made new). The eviction only hands
+/// over one the GPU is done with (it skips those in flight), so the next frame's target takes it)
 void destroy_later(Texture& tex) {
     destroy_gen++;
     Dead d{tex.last_value, tex.image, tex.allocation, {}, {}};
     if (tex.pool_key && tex.allocation && tex.sparse_chunks.empty() && pool_cap()) {   // (a render target's: to the pool, its views too)
         d.pool_key = tex.pool_key, d.view_map = std::move(tex.views), d.bytes = tex.bytes + tex.pad;
         tex.views.clear();
+        pool_put(d);
     } else {
         for (auto& kv : tex.views)
             if (kv.second) d.views.push_back(kv.second);
+        d.memory = tex.sparse_chunks;
+        dead.push_back(std::move(d));
     }
-    d.memory = tex.sparse_chunks;
-    dead.push_back(std::move(d));
     for (const auto& attachment : tex.block_attachments)
         dead.push_back(Dead{tex.last_value, attachment.image, attachment.allocation, {}, {}});
     total_bytes -= std::min(total_bytes, tex.bytes + tex.pad);
@@ -3206,7 +3266,12 @@ void vw_forget(const Texture& t) {   // (the entry goes; other listed textures a
 VkCommandPool rb_pool = VK_NULL_HANDLE;
 VkCommandBuffer rb_cmd = VK_NULL_HANDLE;
 VkFence rb_fence = VK_NULL_HANDLE;
+bool rb_pending = false;   // (a submission whose wait timed out: the GPU may still have its command buffer and fence)
 bool readback_begin() {
+    if (rb_pending) {   // (not reset, nor begun again, while pending: waited for first, or this read-back is not made)
+        if (vkWaitForFences(dev.device, 1, &rb_fence, VK_TRUE, 5000000000ull) != VK_SUCCESS) return false;
+        rb_pending = false;
+    }
     if (!rb_pool) {
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pi.queueFamilyIndex = dev.queue_family;
@@ -3218,8 +3283,12 @@ bool readback_begin() {
         ai.commandBufferCount = 1;
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if (vkAllocateCommandBuffers(dev.device, &ai, &rb_cmd) != VK_SUCCESS ||
-            vkCreateFence(dev.device, &fi, nullptr, &rb_fence) != VK_SUCCESS)
+            vkCreateFence(dev.device, &fi, nullptr, &rb_fence) != VK_SUCCESS) {
+            // (made again next time, not used half made: a null rb_cmd or rb_fence with rb_pool set)
+            vkDestroyCommandPool(dev.device, rb_pool, nullptr);
+            rb_pool = VK_NULL_HANDLE, rb_cmd = VK_NULL_HANDLE, rb_fence = VK_NULL_HANDLE;
             return false;
+        }
     }
     vkResetCommandPool(dev.device, rb_pool, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -3261,7 +3330,8 @@ bool readback_submit_wait() {
         queue_flush_locked();
         if (vkQueueSubmit2(dev.queue, 1, &si, rb_fence) != VK_SUCCESS) return false;
     }
-    return vkWaitForFences(dev.device, 1, &rb_fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
+    rb_pending = vkWaitForFences(dev.device, 1, &rb_fence, VK_TRUE, 5000000000ull) != VK_SUCCESS;
+    return !rb_pending;
 }
 /// A texture's write-back: its image's levels and layers read back, swizzled as the storage lays them out, and written into
 /// its memory within [clip_lo, clip_hi). The GPU half (flush_record) goes into rb_cmd, the CPU half (flush_finish) runs once
@@ -3861,6 +3931,12 @@ VkDeviceSize sparse_added = 0;
 bool sparse_take(Texture* tex, VkDeviceSize n, VkDeviceMemory& mem, VkDeviceSize& off) {
     constexpr VkDeviceSize kChunk = 64ull << 20;
     n = (n + tex->sparse_align - 1) / tex->sparse_align * tex->sparse_align;
+    for (size_t i = 0; i < tex->sparse_free.size(); i++) {   // (a failed bind's memory first: a bind that keeps failing takes no more)
+        if (tex->sparse_free[i].size < n) continue;
+        mem = tex->sparse_free[i].memory, off = tex->sparse_free[i].offset;
+        tex->sparse_free.erase(tex->sparse_free.begin() + (std::ptrdiff_t)i);
+        return true;
+    }
     if (tex->sparse_chunks.empty() || tex->chunk_used + n > kChunk) {
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = std::max(kChunk, n);
@@ -3882,6 +3958,33 @@ bool sparse_take(Texture* tex, VkDeviceSize n, VkDeviceMemory& mem, VkDeviceSize
     return true;
 }
 
+/// The queued binds that were not made: their blocks and mip tails marked unbound again, so the next write to them
+/// queues them anew rather than writing into unbacked memory (their memory goes to the texture's free list, for the retry)
+void sparse_unqueue(Texture* tex) {
+    const VkSparseImageMemoryRequirements& r = tex->sparse_req;
+    const VkExtent3D g = r.formatProperties.imageGranularity;
+    for (const VkSparseImageMemoryBind& b : sparse_binds) {
+        const uint32_t level = b.subresource.mipLevel, layer = b.subresource.arrayLayer;
+        if (level >= tex->levels || layer >= tex->layers || !g.width || !g.height) continue;
+        std::vector<uint8_t>& map = tex->tiles[(size_t)layer * tex->levels + level];
+        const uint32_t lw = std::max(1u, tex->width >> level);
+        const size_t i = (size_t)(b.offset.y / g.height) * ((lw + g.width - 1) / g.width) + b.offset.x / g.width;
+        if (i < map.size()) map[i] = 0;
+        tex->sparse_free.push_back({b.memory, b.memoryOffset, tex->sparse_align});
+    }
+    const bool single = r.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT;
+    for (const VkSparseMemoryBind& b : sparse_opaque) {
+        const VkDeviceSize layer = single || !r.imageMipTailStride ? 0 : (b.resourceOffset - r.imageMipTailOffset) / r.imageMipTailStride;
+        if (layer < tex->tail_bound.size()) tex->tail_bound[layer] = 0;
+        const VkDeviceSize a = tex->sparse_align ? tex->sparse_align : 1;
+        tex->sparse_free.push_back({b.memory, b.memoryOffset, (b.size + a - 1) / a * a});
+    }
+    total_bytes += sparse_added;
+    sparse_added = 0;
+    sparse_binds.clear();
+    sparse_opaque.clear();
+}
+
 bool sparse_flush(Texture* tex) {
     if (sparse_binds.empty() && sparse_opaque.empty()) return true;
     VkSparseImageMemoryBindInfo ib{tex->image, (uint32_t)sparse_binds.size(), sparse_binds.data()};
@@ -3894,7 +3997,13 @@ bool sparse_flush(Texture* tex) {
     static VkFence fence = VK_NULL_HANDLE;
     if (!fence) {
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        vkCreateFence(dev.device, &fi, nullptr, &fence);
+        if (vkCreateFence(dev.device, &fi, nullptr, &fence) != VK_SUCCESS) {   // (never a bind waited on through a null fence)
+            fence = VK_NULL_HANDLE;
+            static int logged;   // (retried on the next write: capped like the other sparse messages)
+            if (logged++ < 8) logf("vk: sparse texture %#llx: no fence for its binds", (unsigned long long)tex->gpu);
+            sparse_unqueue(tex);
+            return false;
+        }
     }
     VkResult res;
     {   // (bound before any work that writes the blocks is submitted: waited for here, on the recording thread. And
@@ -3914,7 +4023,10 @@ bool sparse_flush(Texture* tex) {
         vkWaitForFences(dev.device, 1, &fence, VK_TRUE, UINT64_MAX);
         vkResetFences(dev.device, 1, &fence);
     } else {
-        logf("vk: sparse texture %#llx: binding failed (%d)", (unsigned long long)tex->gpu, (int)res);
+        static int failed;   // (retried on the next write: capped like the other sparse messages)
+        if (failed++ < 8) logf("vk: sparse texture %#llx: binding failed (%d)", (unsigned long long)tex->gpu, (int)res);
+        sparse_unqueue(tex);
+        return false;
     }
     static int logged;
     static uint64_t next_mb = 0;
@@ -4058,6 +4170,14 @@ VkBufferView texel_buffer_view(const nvn_tex* t, const nvn_view* v, bool storage
     const int nf = view_nvn_format(t, v);
     VkFormat f = vk_format(nf).format;
     if (f == VK_FORMAT_UNDEFINED) return VK_NULL_HANDLE;
+    {   // (a format the device has no texel buffers of, e.g. some 3-component ones: no view rather than an invalid one)
+        if (!(format_props(f).bufferFeatures & (storage ? VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT : VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT))) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                logf("vk: texel buffer of format %d (%s) not supported by the device: unbound", (int)f, storage ? "storage" : "uniform");
+            return VK_NULL_HANDLE;
+        }
+    }
     int bw = 1, bh = 1;
     const int bpb = nvn_block_size(nf, &bw, &bh);
     if (bpb <= 0) return VK_NULL_HANDLE;
@@ -4574,8 +4694,8 @@ void texture_frame(uint64_t completed) {
             }
         }
     }
-    // (hookshot) the 90% rule and the driver's limit let go of their excess, not of an eighth of the cache: vram_compact.h.
-    // RX_VK_EVICT_EXCESS=0: to 7/8 of their budget, as before
+    // (hookshot) the 90% rule and the driver's limit let go of their excess, not of an eighth of the cache, while that excess is
+    // small (a large one is cut to 7/8 as before): vram_compact.h. RX_VK_EVICT_EXCESS=0: always to 7/8 of their budget, as before
     static const bool excess_only = !getenv("RX_VK_EVICT_EXCESS") || atoi(getenv("RX_VK_EVICT_EXCESS")) != 0;
     const uint64_t rule_to = excess_only ? vram_compact::rule_target(total_bytes, size_budget, rule_budget)
                                          : vram_compact::rule_target(total_bytes, rule_budget);
@@ -4715,8 +4835,11 @@ void texture_frame(uint64_t completed) {
             if (o->second != tex && o->second->last_written > tex->last_frame) return true;
         return false;
     };
-    // (hookshot-amd) a render target of one level and layer whose storage another render target drew over from another start
-    // after its last use (target_overlap.h): the transient targets above. Its texels are gone from that memory on the console too
+    // (hookshot-amd) a render target of one level and layer whose storage newer render targets drew over from another start
+    // after its last use (target_overlap.h): the transient targets above. Its texels are gone from that memory on the console
+    // too. Their shares are added up, several over parts of it: judged one by one (an eighth each) they left the big ones, and
+    // what was missed grew to 3-4 GB of target images (issue 2180). A newer target inside it is a view of a part of it, not a
+    // new target (5bfa6aa, PR #899): counted, a live scene target would go on its sub-rects being drawn as views
     const auto drawn_over_shifted = [&](const Texture* tex) {
         if (!dead_targets || !tex->gpu_written || !tex->first_render_frame || !tex->guest_size || tex->levels != 1 ||
             tex->layers != 1 || tex->depth > 1)
@@ -4724,11 +4847,11 @@ void texture_frame(uint64_t completed) {
         const uint64_t lo = tex->gpu, hi = tex->gpu + tex->guest_size;
         auto it = std::lower_bound(by_start.begin(), by_start.end(), lo > longest ? lo - longest : 0,
                                    [](const Texture* t, uint64_t g) { return t->gpu < g; });
+        target_overlap::DrawnOver over;
         for (; it != by_start.end() && (*it)->gpu < hi; ++it)
-            if (*it != tex && target_overlap::shifted_over(lo, hi, tex->last_frame, (*it)->gpu, (*it)->gpu + (*it)->guest_size,
-                                                           (*it)->last_written))
-                return true;
-        return false;
+            if (*it != tex)
+                over.add(lo, hi, tex->last_frame, (*it)->gpu, (*it)->gpu + (*it)->guest_size, (*it)->last_written);
+        return over.an_eighth(hi - lo);
     };
     // (the transient targets: a frame's own, not sampled again, their storage drawn over by another since. 16 frames left
     // ~500 MB of them in Hyrule Castle Town's market at 20 fps (59 768 x 432 RGBA16F, 135 384 x 384, 41 1536 x 864 at a
